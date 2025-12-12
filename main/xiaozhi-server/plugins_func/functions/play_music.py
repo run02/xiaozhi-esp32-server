@@ -5,6 +5,9 @@ import random
 import difflib
 import traceback
 from pathlib import Path
+import asyncio  # 新增
+import requests  # 新增
+
 from core.handle.sendAudioHandle import send_stt_message
 from plugins_func.register import register_function, ToolType, ActionResponse, Action
 from core.utils.dialogue import Message
@@ -140,32 +143,162 @@ def initialize_music_handler(conn):
         MUSIC_CACHE["scan_time"] = time.time()
     return MUSIC_CACHE
 
-
 async def handle_music_command(conn, text):
     initialize_music_handler(conn)
     global MUSIC_CACHE
 
-    """处理音乐播放指令"""
+    """
+    处理音乐播放指令（仅修改取文件逻辑，其余完全保留原始处理流程）：
+    - 优先通过 Subsonic 在 /tmp/xiaozhi-music 下载歌曲（文件名=真实歌曲名.mp3）
+    - 若成功 → 调用原生 play_local_music 播放
+    - 若失败 → 完整退回原生本地随机播放逻辑
+    """
+
+    # 强制音乐目录改成 /tmp/xiaozhi-music
+    MUSIC_CACHE["music_dir"] = "/tmp/xiaozhi-music"
+    os.makedirs(MUSIC_CACHE["music_dir"], exist_ok=True)
+
     clean_text = re.sub(r"[^\w\s]", "", text).strip()
     conn.logger.bind(tag=TAG).debug(f"检查是否是音乐命令: {clean_text}")
 
-    # 尝试匹配具体歌名
-    if os.path.exists(MUSIC_CACHE["music_dir"]):
+    # ------- Subsonic 固定配置 -------
+    BASE_URL = "http://cspugoing:4533/rest"
+
+    def _common_params():
+        return {
+            "u": "u",
+            "p": "p",
+            "v": "1.16.1",
+            "c": "xiaozhi",
+            "f": "json",
+        }
+
+    # ------------------------
+    # 下载文件并保存为 "歌曲名.mp3"
+    # ------------------------
+    def _download_song(song_id: str, song_title: str):
+        safe_title = re.sub(r'[\\/:*?"<>|]', "_", song_title)
+        file_name = f"{safe_title}.mp3"
+        full_path = os.path.join(MUSIC_CACHE["music_dir"], file_name)
+
+        # 已存在直接用
+        if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
+            return file_name
+
+        url = f"{BASE_URL}/stream.view"
+        params = _common_params()
+        params["id"] = song_id
+
+        r = requests.get(url, params=params, timeout=60, stream=True)
+        r.raise_for_status()
+
+        with open(full_path, "wb") as f:
+            for chunk in r.iter_content(64 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+        return file_name
+
+    # ------------------------
+    # 按歌名搜索
+    # ------------------------
+    def _search_song_and_download(query: str):
+        url = f"{BASE_URL}/search2.view"
+        params = _common_params()
+        params.update({"query": query, "songCount": 30})
+
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("subsonic-response", {})
+        result = data.get("searchResult2", {})
+        songs = result.get("song") or []
+
+        if isinstance(songs, dict):
+            songs = [songs]
+        if not songs:
+            return None
+
+        # 按相似度选歌曲
+        best = None
+        best_ratio = 0.0
+        for s in songs:
+            title = s.get("title") or ""
+            ratio = difflib.SequenceMatcher(None, query, title).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = s
+
+        if not best or best_ratio < 0.3:
+            return None
+
+        return _download_song(best["id"], best["title"])
+
+    # ------------------------
+    # 随机取一首
+    # ------------------------
+    def _random_song_and_download():
+        url = f"{BASE_URL}/getRandomSongs.view"
+        params = _common_params()
+        params["size"] = 50
+
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+
+        data = resp.json().get("subsonic-response", {})
+        songs = data.get("randomSongs", {}).get("song") or []
+
+        if isinstance(songs, dict):
+            songs = [songs]
+        if not songs:
+            return None
+
+        s = random.choice(songs)
+        return _download_song(s["id"], s.get("title") or "未知歌曲")
+
+    # ---------------------------------------------------------------------
+    # 以下开始 "完全保留原生逻辑"，只是把 specific_file 换成 Subsonic 下载的文件名
+    # ---------------------------------------------------------------------
+    try:
+        # 原生逻辑：刷新文件列表
         if time.time() - MUSIC_CACHE["scan_time"] > MUSIC_CACHE["refresh_time"]:
-            # 刷新音乐文件列表
-            MUSIC_CACHE["music_files"], MUSIC_CACHE["music_file_names"] = (
+            MUSIC_CACHE["music_files"], MUSIC_CACHE["music_file_names"] = \
                 get_music_files(MUSIC_CACHE["music_dir"], MUSIC_CACHE["music_ext"])
-            )
             MUSIC_CACHE["scan_time"] = time.time()
 
+        # 抽取歌名
         potential_song = _extract_song_name(clean_text)
+
+        # --- 1. 有指定歌名就先搜 ---
         if potential_song:
-            best_match = _find_best_match(potential_song, MUSIC_CACHE["music_files"])
-            if best_match:
-                conn.logger.bind(tag=TAG).info(f"找到最匹配的歌曲: {best_match}")
-                await play_local_music(conn, specific_file=best_match)
+            conn.logger.bind(tag=TAG).info(f"通过 Subsonic 搜索歌曲: {potential_song}")
+            specific_file = _search_song_and_download(potential_song)
+            if specific_file:
+                conn.logger.bind(tag=TAG).info(
+                    f"Subsonic 找到并下载歌曲: {potential_song} -> {specific_file}"
+                )
+                await play_local_music(conn, specific_file=specific_file)
                 return True
-    # 检查是否是通用播放音乐命令
+
+            conn.logger.bind(tag=TAG).warning(
+                f"Subsonic 未找到歌曲: {potential_song}，准备随机播放"
+            )
+
+        # --- 2. 没有歌名 / 搜不到 → 随机 ---
+        conn.logger.bind(tag=TAG).info("通过 Subsonic 随机选择歌曲播放")
+        specific_file = _random_song_and_download()
+        if specific_file:
+            conn.logger.bind(tag=TAG).info(
+                f"Subsonic 随机播放歌曲 -> {specific_file}"
+            )
+            await play_local_music(conn, specific_file=specific_file)
+            return True
+
+    except Exception as e:
+        conn.logger.bind(tag=TAG).error(f"Subsonic 处理异常: {e}")
+        conn.logger.bind(tag=TAG).error(f"{traceback.format_exc()}")
+
+    # --- 3. 全部失败 → 退回原生随机播放 ---
+    conn.logger.bind(tag=TAG).warning("Subsonic 播放失败 → 回退到本地随机播放")
     await play_local_music(conn)
     return True
 
